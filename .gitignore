@@ -1,0 +1,5 @@
+build/
+build-libs/
+*.p12
+*.apk
+!ABIX-Cloner.apk
