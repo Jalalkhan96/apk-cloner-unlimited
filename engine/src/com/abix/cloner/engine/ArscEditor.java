@@ -22,6 +22,15 @@ public final class ArscEditor {
 
     public byte[] rewrite(byte[] arsc, String oldPackage, String newPackage,
                           List<Integer> labelResIds, String labelSuffix) {
+        return rewrite(arsc, oldPackage, newPackage, labelResIds, labelSuffix, null);
+    }
+
+    /**
+     * When labelOverride is non-null, the label string resources are set to
+     * that exact text (custom clone name) instead of original + suffix.
+     */
+    public byte[] rewrite(byte[] arsc, String oldPackage, String newPackage,
+                          List<Integer> labelResIds, String labelSuffix, String labelOverride) {
         if (u16(arsc, 0) != TYPE_TABLE) throw new IllegalArgumentException("not a resources.arsc");
         int pos = u16(arsc, 2); // header size
         // first chunk should be the global string pool
@@ -51,11 +60,17 @@ public final class ArscEditor {
         }
         if (pkgNameChunkOff < 0) throw new IllegalArgumentException("arsc: package chunk for " + oldPackage + " not found");
 
-        // append suffix to the label strings in the pool
+        // patch the label strings in the pool: exact override when a custom
+        // clone name was given, otherwise append the suffix
         for (int idx : labelPoolIdx) {
             if (idx >= 0 && idx < pool.strings.size()) {
                 String v = pool.strings.get(idx);
-                if (!v.endsWith(labelSuffix)) {
+                if (labelOverride != null) {
+                    if (!v.equals(labelOverride)) {
+                        pool.strings.set(idx, labelOverride);
+                        labelStringsPatched++;
+                    }
+                } else if (!v.endsWith(labelSuffix)) {
                     pool.strings.set(idx, v + labelSuffix);
                     labelStringsPatched++;
                 }
@@ -141,6 +156,83 @@ public final class ArscEditor {
                         int data = u32(arsc, entryPos + 8 + 4);
                         if (dataType == DATA_TYPE_STRING) outIdx.add(data);
                     }
+                }
+            }
+            pos += size;
+        }
+    }
+
+    private static final int DATA_TYPE_REFERENCE = 0x01;
+
+    /**
+     * Resolve resource ids (e.g. the app icon) to the file paths their
+     * entries point at, across all configurations. File resources are
+     * stored as string values holding the path ("res/mipmap-.../x.png").
+     * One level of reference indirection (aliases) is followed.
+     */
+    public static Set<String> collectResourcePaths(byte[] arsc, String oldPackage, List<Integer> resIds) {
+        Set<String> out = new LinkedHashSet<>();
+        if (resIds == null || resIds.isEmpty()) return out;
+        if (u16(arsc, 0) != TYPE_TABLE) return out;
+        int pos = u16(arsc, 2);
+        if (u16(arsc, pos) != TYPE_STRING_POOL) return out;
+        int poolOff = pos;
+        int poolSize = u32(arsc, poolOff + 4);
+        StringPools pool = StringPools.parse(arsc, poolOff);
+
+        Set<Integer> refs = new LinkedHashSet<>();
+        collectEntryStrings(arsc, poolOff, poolSize, oldPackage, resIds, pool, out, refs);
+        if (!refs.isEmpty()) {
+            collectEntryStrings(arsc, poolOff, poolSize, oldPackage,
+                    new java.util.ArrayList<>(refs), pool, out, new LinkedHashSet<>());
+        }
+        return out;
+    }
+
+    /** Like collectLabelStrings, but for any resource type: collects the string values (paths) of the given resIds. */
+    private static void collectEntryStrings(byte[] arsc, int poolOff, int poolSize, String oldPackage,
+                                            List<Integer> resIds, StringPools pool,
+                                            Set<String> outPaths, Set<Integer> outRefs) {
+        int pos = poolOff + poolSize;
+        int fileEnd = arsc.length;
+        while (pos + 8 <= fileEnd) {
+            int type = u16(arsc, pos);
+            int size = u32(arsc, pos + 4);
+            if (size <= 0) break;
+            if (type == TYPE_PACKAGE && oldPackage.equals(readPkgName(arsc, pos))) {
+                int pkgId = u32(arsc, pos + 8);
+                int headerSize = u16(arsc, pos + 2);
+                int tPos = pos + headerSize;
+                int end = pos + size;
+                while (tPos + 8 <= end) {
+                    int cType = u16(arsc, tPos);
+                    int cSize = u32(arsc, tPos + 4);
+                    if (cSize <= 0) break;
+                    if (cType == TYPE_TYPE) {
+                        int typeId = arsc[tPos + 8] & 0xFF;
+                        int entryCount = u32(arsc, tPos + 12);
+                        int entriesStart = u32(arsc, tPos + 16);
+                        int typeHeaderSize = u16(arsc, tPos + 2);
+                        for (int resId : resIds) {
+                            if (((resId >> 24) & 0xFF) != pkgId) continue;
+                            if (((resId >> 16) & 0xFF) != typeId) continue;
+                            int entryIdx = resId & 0xFFFF;
+                            if (entryIdx >= entryCount) continue;
+                            int eOff = u32(arsc, tPos + typeHeaderSize + entryIdx * 4);
+                            if (eOff == -1) continue;
+                            int entryPos = tPos + entriesStart + eOff;
+                            int eFlags = u16(arsc, entryPos + 2);
+                            if ((eFlags & 0x0001) != 0) continue; // complex entry (bag)
+                            int dataType = arsc[entryPos + 8 + 3] & 0xFF;
+                            int data = u32(arsc, entryPos + 8 + 4);
+                            if (dataType == DATA_TYPE_STRING) {
+                                if (data >= 0 && data < pool.strings.size()) outPaths.add(pool.strings.get(data));
+                            } else if (dataType == DATA_TYPE_REFERENCE) {
+                                outRefs.add(data);
+                            }
+                        }
+                    }
+                    tPos += cSize;
                 }
             }
             pos += size;

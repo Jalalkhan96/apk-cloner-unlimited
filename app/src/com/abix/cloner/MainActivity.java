@@ -6,6 +6,8 @@ import android.app.ProgressDialog;
 import android.content.Intent;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.drawable.Drawable;
 import android.net.Uri;
 import android.os.Bundle;
@@ -14,6 +16,7 @@ import android.text.TextWatcher;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.BaseAdapter;
+import android.widget.Button;
 import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.ImageView;
@@ -25,6 +28,7 @@ import android.widget.Toast;
 import com.abix.cloner.engine.CloneEngine;
 import com.android.apksig.ApkSigner;
 
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
@@ -37,12 +41,21 @@ import java.util.List;
 
 public class MainActivity extends Activity {
     private static final String KS_PASS = "AbixClone#2026";
+    private static final int REQ_ICON = 42;
 
     private final List<AppEntry> allApps = new ArrayList<>();
     private final List<AppEntry> shownApps = new ArrayList<>();
     private AppAdapter adapter;
     private CheckBox systemCheck;
     private EditText searchBox;
+
+    // Clone-dialog state, kept across the icon-picker round trip.
+    private AppEntry pendingEntry;
+    private String pendingPkg;
+    private String pendingName;
+    private byte[] pendingIconPng;
+    private Bitmap pendingIconBitmap;
+    private ImageView pendingIconPreview;
 
     private static final class AppEntry {
         String label;
@@ -66,18 +79,18 @@ public class MainActivity extends Activity {
         root.addView(title);
 
         TextView sub = new TextView(this);
-        sub.setText("Kisi bhi app ki copy banao — copy home screen par alag app ban kar lagegi. No ads, no tracking.");
+        sub.setText("Clone any app — the copy installs as a separate app with its own data.\nKisi bhi app ki copy banao — alag app, alag data. No ads, no tracking.");
         sub.setTextSize(13);
         sub.setPadding(0, 0, 0, 12);
         root.addView(sub);
 
         searchBox = new EditText(this);
-        searchBox.setHint("App search karo...");
+        searchBox.setHint("Search apps... (app dhoondo)");
         searchBox.setSingleLine(true);
         root.addView(searchBox);
 
         systemCheck = new CheckBox(this);
-        systemCheck.setText("System apps bhi dikhao");
+        systemCheck.setText("Show system apps (system apps bhi dikhao)");
         root.addView(systemCheck);
 
         ListView list = new ListView(this);
@@ -94,7 +107,10 @@ public class MainActivity extends Activity {
             @Override public void onTextChanged(CharSequence s, int a, int b, int c) { }
         });
         systemCheck.setOnCheckedChangeListener((v, checked) -> applyFilter());
-        list.setOnItemClickListener((parent, view, position, id) -> confirmClone(shownApps.get(position)));
+        list.setOnItemClickListener((parent, view, position, id) -> {
+            clearPending();
+            confirmClone(shownApps.get(position));
+        });
 
         loadApps();
     }
@@ -151,25 +167,140 @@ public class MainActivity extends Activity {
         }
     }
 
+    /** Clone number for a clone package: pkg.clone -> 1, pkg.clone2 -> 2, ... */
+    private static int cloneNumber(String pkg, String newPkg) {
+        String suffix = newPkg.substring(pkg.length());
+        if (suffix.equals(".clone")) return 1;
+        try {
+            return Integer.parseInt(suffix.substring(".clone".length()));
+        } catch (RuntimeException e) {
+            return 1;
+        }
+    }
+
+    /** Apps that protect themselves with signature / integrity checks. */
+    private static boolean isProtectedApp(String pkg) {
+        return pkg.equals("com.whatsapp")
+                || pkg.equals("com.whatsapp.w4b")
+                || pkg.equals("com.zhiliaoapp.musically")
+                || pkg.equals("com.ss.android.ugc.trill");
+    }
+
+    private void clearPending() {
+        pendingEntry = null;
+        pendingPkg = null;
+        pendingName = null;
+        pendingIconPng = null;
+        pendingIconBitmap = null;
+        pendingIconPreview = null;
+    }
+
     private void confirmClone(AppEntry entry) {
-        String newPkg = nextClonePackage(entry.pkg);
+        final String newPkg = (pendingEntry == entry && pendingPkg != null)
+                ? pendingPkg : nextClonePackage(entry.pkg);
+        final int number = cloneNumber(entry.pkg, newPkg);
+        final String defaultName = entry.label + " Clone " + number;
         boolean hasSplits = entry.info.splitSourceDirs != null && entry.info.splitSourceDirs.length > 0;
-        String msg = "App: " + entry.label + "\n"
-                + "Copy ka naam: " + entry.label + " Clone\n"
-                + "Copy ka package: " + newPkg + "\n\n"
-                + "Copy alag app ban kar install hogi — home screen par is ka apna icon hoga aur apna data hoga."
-                + (hasSplits ? "\n\nNote: ye app split APK hai — copy adhoori ho sakti hai." : "");
+
+        String info = "App: " + entry.label + "\n"
+                + "Clone package: " + newPkg + "\n\n"
+                + "The clone installs as its own app — its own home-screen icon and its own data.\n"
+                + "Copy alag app ban kar install hogi — apna icon, apna data."
+                + (hasSplits ? "\n\nThis app is installed in split parts — all parts will be merged into the clone automatically.\nYe app split parts mein hai — saaray parts copy mein shamil kar diye jayenge." : "")
+                + (isProtectedApp(entry.pkg)
+                    ? "\n\n⚠ Protected app: this app checks its official signature, so the clone is created in full, but the app itself may refuse to run or sign in. That block is the app's own protection — no cloner can remove it.\nYe app apni hifazat khud karti hai — copy poori banegi, lekin app khud chalne ya sign-in se inkaar kar sakti hai."
+                    : "");
+
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(48, 16, 48, 8);
+
+        TextView infoView = new TextView(this);
+        infoView.setText(info);
+        box.addView(infoView);
+
+        TextView nameLabel = new TextView(this);
+        nameLabel.setText("\nClone name (clone ka naam):");
+        box.addView(nameLabel);
+
+        final EditText nameField = new EditText(this);
+        nameField.setSingleLine(true);
+        nameField.setText(pendingEntry == entry && pendingName != null ? pendingName : defaultName);
+        nameField.setSelection(nameField.getText().length());
+        box.addView(nameField);
+
+        TextView iconLabel = new TextView(this);
+        iconLabel.setText("\nClone icon (clone ka icon):");
+        box.addView(iconLabel);
+
+        LinearLayout iconRow = new LinearLayout(this);
+        iconRow.setOrientation(LinearLayout.HORIZONTAL);
+        final ImageView preview = new ImageView(this);
+        preview.setLayoutParams(new LinearLayout.LayoutParams(120, 120));
+        if (pendingEntry == entry && pendingIconBitmap != null) preview.setImageBitmap(pendingIconBitmap);
+        else preview.setImageDrawable(entry.icon);
+        iconRow.addView(preview);
+        Button pick = new Button(this);
+        pick.setText("Choose custom icon\n(apna icon chuno)");
+        iconRow.addView(pick);
+        box.addView(iconRow);
+        pendingIconPreview = preview;
+
+        pick.setOnClickListener(v -> {
+            pendingEntry = entry;
+            pendingPkg = newPkg;
+            pendingName = nameField.getText().toString();
+            Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+            intent.setType("image/*");
+            intent.addCategory(Intent.CATEGORY_OPENABLE);
+            try {
+                startActivityForResult(intent, REQ_ICON);
+            } catch (RuntimeException e) {
+                Toast.makeText(this, "No image picker found (image picker nahi mila)", Toast.LENGTH_LONG).show();
+            }
+        });
+
         new AlertDialog.Builder(this)
-                .setTitle("Clone banayein?")
-                .setMessage(msg)
-                .setNegativeButton("Cancel", null)
-                .setPositiveButton("Clone banao", (d, w) -> doClone(entry, newPkg))
+                .setTitle("Create clone?")
+                .setView(box)
+                .setNegativeButton("Cancel", (d, w) -> clearPending())
+                .setPositiveButton("Create Clone", (d, w) -> {
+                    String name = nameField.getText().toString().trim();
+                    if (name.isEmpty()) name = defaultName;
+                    CloneEngine.Options opts = new CloneEngine.Options();
+                    opts.labelOverride = name;
+                    opts.iconPng = (pendingEntry == entry) ? pendingIconPng : null;
+                    clearPending();
+                    doClone(entry, newPkg, opts, name);
+                })
                 .show();
     }
 
-    private void doClone(AppEntry entry, String newPkg) {
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != REQ_ICON || resultCode != RESULT_OK || data == null || data.getData() == null) return;
+        try {
+            Bitmap decoded;
+            try (InputStream in = getContentResolver().openInputStream(data.getData())) {
+                decoded = BitmapFactory.decodeStream(in);
+            }
+            if (decoded == null) throw new IllegalStateException("image could not be read");
+            Bitmap scaled = Bitmap.createScaledBitmap(decoded, 512, 512, true);
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            scaled.compress(Bitmap.CompressFormat.PNG, 100, out);
+            pendingIconPng = out.toByteArray();
+            pendingIconBitmap = scaled;
+            if (pendingIconPreview != null) pendingIconPreview.setImageBitmap(scaled);
+            Toast.makeText(this, "Custom icon set (icon lag gaya) — now tap Create Clone", Toast.LENGTH_LONG).show();
+        } catch (Exception e) {
+            Toast.makeText(this, "Icon failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void doClone(AppEntry entry, String newPkg, CloneEngine.Options opts, String cloneName) {
         ProgressDialog progress = new ProgressDialog(this);
-        progress.setMessage("Clone ban raha hai: " + entry.label + " ...");
+        progress.setMessage("Creating clone: " + cloneName + " ...");
         progress.setCancelable(false);
         progress.show();
 
@@ -180,20 +311,29 @@ public class MainActivity extends Activity {
                 File unsigned = new File(clonesDir, "unsigned.apk");
                 File signed = new File(clonesDir, newPkg + ".apk");
 
-                CloneEngine.Report report = new CloneEngine().cloneApk(
-                        new File(entry.info.publicSourceDir), unsigned, newPkg, " Clone");
+                CloneEngine.Report report;
+                String[] splitDirs = entry.info.splitSourceDirs;
+                if (splitDirs != null && splitDirs.length > 0) {
+                    File[] splits = new File[splitDirs.length];
+                    for (int i = 0; i < splitDirs.length; i++) splits[i] = new File(splitDirs[i]);
+                    report = new CloneEngine().cloneMerged(
+                            new File(entry.info.publicSourceDir), splits, unsigned, newPkg, " Clone", opts);
+                } else {
+                    report = new CloneEngine().cloneApk(
+                            new File(entry.info.publicSourceDir), unsigned, newPkg, " Clone", opts);
+                }
                 signApk(unsigned, signed, entry.info.minSdkVersion);
                 unsigned.delete();
 
                 runOnUiThread(() -> {
                     progress.dismiss();
-                    installClone(signed, report);
+                    installClone(signed, report, cloneName);
                 });
             } catch (Exception e) {
                 runOnUiThread(() -> {
                     progress.dismiss();
                     new AlertDialog.Builder(this)
-                            .setTitle("Clone nahi bana")
+                            .setTitle("Clone failed (clone nahi bana)")
                             .setMessage(String.valueOf(e.getMessage()))
                             .setPositiveButton("OK", null)
                             .show();
@@ -222,18 +362,25 @@ public class MainActivity extends Activity {
                 .sign();
     }
 
-    private void installClone(File apk, CloneEngine.Report report) {
+    private void installClone(File apk, CloneEngine.Report report, String cloneName) {
         Uri uri = Uri.parse("content://com.abix.cloner.fileprovider/" + apk.getName());
         Intent intent = new Intent(Intent.ACTION_VIEW);
         intent.setDataAndType(uri, "application/vnd.android.package-archive");
         intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
         try {
             startActivity(intent);
-            Toast.makeText(this, "Clone tayyar: " + report.newPackage, Toast.LENGTH_LONG).show();
+            String toast = "Clone ready: " + cloneName
+                    + (report.splitsMerged > 0
+                        ? " (" + report.splitsMerged + " split parts merged)"
+                        : "")
+                    + (report.iconEntriesReplaced > 0
+                        ? " (custom icon applied)"
+                        : "");
+            Toast.makeText(this, toast, Toast.LENGTH_LONG).show();
         } catch (RuntimeException e) {
             new AlertDialog.Builder(this)
-                    .setTitle("Install nahi khula")
-                    .setMessage("Clone file ban gayi hai lekin installer nahi khula: " + e.getMessage())
+                    .setTitle("Installer did not open")
+                    .setMessage("The clone file was created but the installer did not open: " + e.getMessage())
                     .setPositiveButton("OK", null)
                     .show();
         }

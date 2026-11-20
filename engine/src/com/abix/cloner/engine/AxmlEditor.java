@@ -25,6 +25,11 @@ public final class AxmlEditor {
 
     public String oldPackage;
     public final List<Integer> labelResIds = new ArrayList<>();
+    /** Resource id of the application android:icon reference, or -1. */
+    public int iconResId = -1;
+    /** Resource id of the application android:roundIcon reference, or -1. */
+    public int roundIconResId = -1;
+    private String labelOverride;
 
     private static final class AttrPatch {
         int chunkOff;      // offset of the start-element chunk in the ORIGINAL bytes
@@ -33,6 +38,15 @@ public final class AxmlEditor {
     }
 
     public byte[] rewrite(byte[] axml, String newPackage, String labelSuffix) {
+        return rewrite(axml, newPackage, labelSuffix, null);
+    }
+
+    /**
+     * When labelOverride is non-null, app/activity labels are set to that
+     * exact text (custom clone name) instead of original + suffix.
+     */
+    public byte[] rewrite(byte[] axml, String newPackage, String labelSuffix, String labelOverride) {
+        this.labelOverride = labelOverride;
         if (u32(axml, 0) != 0x00080003) throw new IllegalArgumentException("not a binary XML file");
         // locate the string pool chunk (first chunk)
         int poolOff = 8;
@@ -71,6 +85,10 @@ public final class AxmlEditor {
                     if (dataType == DATA_TYPE_REFERENCE && "label".equals(aName)
                             && ("application".equals(el) || "activity".equals(el) || "activity-alias".equals(el))) {
                         labelResIds.add(data);
+                    }
+                    if (dataType == DATA_TYPE_REFERENCE && "application".equals(el)) {
+                        if ("icon".equals(aName)) iconResId = data;
+                        else if ("roundIcon".equals(aName)) roundIconResId = data;
                     }
                     if (newValue != null && !newValue.equals(value)) {
                         AttrPatch p = new AttrPatch();
@@ -142,6 +160,9 @@ public final class AxmlEditor {
             return newPkg;
         }
         if ("label".equals(attr) && ("application".equals(el) || "activity".equals(el) || "activity-alias".equals(el))) {
+            if (labelOverride != null) {
+                return value.equals(labelOverride) ? null : labelOverride;
+            }
             if (value.endsWith(suffix)) return null;
             return value + suffix;
         }
